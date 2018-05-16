@@ -21,15 +21,18 @@
  ***************************************************************************/
 """
 from PyQt4.QtCore import QSettings, QTranslator, qVersion, QCoreApplication
-from PyQt4.QtGui import QAction, QIcon, QFileDialog
+from PyQt4.QtGui import QAction, QIcon, QFileDialog, QColor
+from qgis.core import QgsRasterLayer, QgsVectorLayer, QgsCoordinateReferenceSystem, QgsRectangle, QgsVector, QgsMapLayer, QgsProject, QgsMapLayerRegistry
+import qgis
 # Initialize Qt resources from file resources.py
 import resources
 # Import the code for the dialog
 from coastline_masker_dialog import CoastlineMaskerDialog
 import os.path
 import coastline_masker_core
+import cv2
 
-
+g_vectorLayer = []
 class CoastlineMasker:
     """QGIS Plugin Implementation."""
 
@@ -184,13 +187,30 @@ class CoastlineMasker:
     def run(self):
         """Run method that performs all the real work"""
         layers = self.iface.legendInterface().layers()
-        layer_list = []
+        raster_layer_list = []
+        domain_layer_list = []
         for layer in layers:
-            layer_list.append(layer.name())
-        self.dlg.comboBox_selectLayer.addItems(layer_list)
-        self.dlg.comboBox_domainLayer.addItems(layer_list)
-        #self.dlg.comboBox_outputLayer.addItems(layer_list)
+            if layer.type() == QgsMapLayer.VectorLayer:
+                domain_layer_list.append(layer.name())
+            elif layer.type() == QgsMapLayer.RasterLayer:
+                raster_layer_list.append(layer.name())
 
+        
+        raster_prefix_list = ['B5', 'BQA']
+        
+        toc = self.iface.legendInterface()
+        root = QgsProject.instance().layerTreeRoot()
+        groups = toc.groups()
+
+        self.dlg.comboBox_rasterLayer.clear()
+        self.dlg.comboBox_rasterPrefix.clear()
+        self.dlg.comboBox_rasterGroup.clear()
+        self.dlg.comboBox_domainLayer.clear()
+        self.dlg.comboBox_rasterLayer.addItems(raster_layer_list)
+        self.dlg.comboBox_rasterPrefix.addItems(raster_prefix_list)
+        self.dlg.comboBox_rasterGroup.addItems(groups)
+        self.dlg.comboBox_domainLayer.addItems(domain_layer_list)
+        
         # show the dialog
         self.dlg.show()
         # Run the dialog event loop
@@ -198,11 +218,47 @@ class CoastlineMasker:
 
         # See if OK was pressed
         if result:
-            selectLayerIndex = self.dlg.comboBox_selectLayer.currentIndex()
-            selectLayer = layers[selectLayerIndex]
+            rasterLayerIndex = self.dlg.comboBox_rasterLayer.currentIndex()
+            rasterPrefixIndex = self.dlg.comboBox_rasterPrefix.currentIndex()
+            rasterGroupIndex = self.dlg.comboBox_rasterGroup.currentIndex()
             domainLayerIndex = self.dlg.comboBox_domainLayer.currentIndex()
-            domainLayer = layers[domainLayerIndex]
-            #outputLayerIndex = self.dlg.comboBox_outputLayer.currentIndex()
-            #outputLayer = layers[outputLayerIndex]
-
-            layer, vectorLayer = coastline_masker_core.generateCoastlineMaskFromLayers(selectLayer, domainLayer, None, [5,15])
+            rasterLayerName = raster_layer_list[rasterLayerIndex]
+            rasterPrefix = raster_prefix_list[rasterPrefixIndex]
+            rasterGroupName = groups[rasterGroupIndex]
+            domainLayerName = domain_layer_list[domainLayerIndex]
+            
+            rasterGroup = root.findGroup(rasterGroupName)
+            rasterLayers = rasterGroup.findLayers()
+            for layer in QgsMapLayerRegistry.instance().mapLayers().values():
+                if layer.name() == domainLayerName:
+                    domainLayer = layer
+                    break
+            
+            for rasterLayer in rasterLayers:
+                try:
+                    if rasterLayer.name().endswith(rasterPrefix):
+                        maskRasterLayer, maskVectorLayer = coastline_masker_core.maskFromLayers(rasterLayer.layer(), domainLayer, None, [5,15])
+                        # step 1: add the layer to the registry, False indicates not to add to the layer tree
+                        #QgsMapLayerRegistry.instance().addMapLayer(maskRasterLayer, False)
+                        QgsMapLayerRegistry.instance().addMapLayer(maskVectorLayer, False)
+                        # step 2: append layer to the root group node
+                        #maskRasterLayerObject = rasterGroup.insertLayer(0, maskRasterLayer)
+                        maskVectorLayerObject = rasterGroup.insertLayer(0, maskVectorLayer)
+                        # step 3: Add transparency slider to layers
+                        #maskRasterLayer.setCustomProperty("embeddedWidgets/count", 1)
+                        #maskRasterLayer.setCustomProperty("embeddedWidgets/0/id", "transparency")      
+                        #qgis.utils.iface.legendInterface().refreshLayerSymbology(maskRasterLayer)
+                        maskVectorLayer.setCustomProperty("embeddedWidgets/count", 1)
+                        maskVectorLayer.setCustomProperty("embeddedWidgets/0/id", "transparency")      
+                        # Alter fill style for vector layers
+                        symbols = maskVectorLayer.rendererV2().symbols()
+                        symbol = symbols[0]
+                        symbol.setColor(QColor.fromRgb(50,50,250,25))
+                        # Redraw canvas and save variable to global context
+                        qgis.utils.iface.legendInterface().refreshLayerSymbology(maskVectorLayer)
+                        g_vectorLayer = maskVectorLayer
+                except cv2.error as e:
+                    print "OpenCV ERROR", e
+                except Exception as e:
+                    print e
+                    

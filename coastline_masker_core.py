@@ -3,12 +3,15 @@ import cv2, processing, os
 from osgeo import gdal
 from gdalconst import *
 from osgeo import osr
+from pymasker import LandsatMasker
+from pymasker import LandsatConfidence
+from pyproj import Proj, transform
 
 from PyQt4 import QtCore, QtGui
 from PyQt4.QtCore import QFile, QFileInfo, QSettings
 from PyQt4.QtGui import QAction, QIcon, QFileDialog
 from qgis import core, gui, utils
-from qgis.core import QgsRasterLayer, QgsCoordinateReferenceSystem, QgsRectangle, QgsVector
+from qgis.core import QgsRasterLayer, QgsCoordinateReferenceSystem, QgsRectangle, QgsVector, QgsVectorLayer
 from qgis.gui import QgsMapCanvasLayer
 from qgis.utils import iface
 
@@ -27,7 +30,7 @@ def geotiffBounds(geotiff):
 
     return QgsRectangle(float(xMin), float(yMin), float(xMax), float(yMax))
 
-def geotiffWorldToPixelCoords(geotiff, rectIn):
+def geotiffWorldToPixelCoords(geotiff, rectDomain, rasterCRS, domainCRS):
     """Transforms QgsRectangle coordinates into geotiff image pixel coordinates
 
     :geotiff: geotiff
@@ -40,16 +43,27 @@ def geotiffWorldToPixelCoords(geotiff, rectIn):
 
     rectRefWidth = rectRef.width()
     rectRefHeight = rectRef.height()
-    xMin = (rectIn.xMinimum() - rectRef.xMinimum()) / rectRefWidth
-    xMax = (rectIn.xMaximum() - rectRef.xMinimum()) / rectRefWidth
-    yMin = (rectIn.yMinimum() - rectRef.yMinimum()) / rectRefHeight
-    yMax = (rectIn.yMaximum() - rectRef.yMinimum()) / rectRefHeight
+
+    domainX = [rectDomain.xMinimum(), rectDomain.xMaximum()]
+    domainY = [rectDomain.yMinimum(), rectDomain.yMaximum()]
+    inProj = Proj(init=domainCRS)
+    outProj = Proj(init=rasterCRS)
+    print domainX, domainY
+    rasterCRSDomainX, rasterCRSDomainY = transform(inProj, outProj, domainX, domainY)
+    print rasterCRSDomainX, rasterCRSDomainY
+
+    xMin = (rasterCRSDomainX[0] - rectRef.xMinimum()) / rectRefWidth
+    xMax = (rasterCRSDomainX[1] - rectRef.xMinimum()) / rectRefWidth
+    yMin = (rasterCRSDomainY[0] - rectRef.yMinimum()) / rectRefHeight
+    yMax = (rasterCRSDomainY[1] - rectRef.yMinimum()) / rectRefHeight
 
     # Scale by image dimensions to obtain pixel coordinates
     xMin = xMin * geotiff.RasterXSize
     xMax = xMax * geotiff.RasterXSize
     yMin = (1.0 - yMin) * geotiff.RasterYSize
     yMax = (1.0 - yMax) * geotiff.RasterYSize
+
+    print rasterCRS, domainCRS
 
     #Return pixel coordinates
     rectOut = QgsRectangle(xMin, yMin, xMax, yMax)
@@ -112,6 +126,11 @@ def filterImage(geotiff,bounds,edgeMin=25,edgeMax=100,kernelSize=5):
     img = geotiff.GetRasterBand(1)
     img = img.ReadAsArray(0,0,geotiff.RasterXSize,geotiff.RasterYSize)
     img = img[int(round(bounds.yMinimum())):int(round(bounds.yMaximum())), int(round(bounds.xMinimum())):int(round(bounds.xMaximum()))]
+    print int(round(bounds.yMinimum())), int(round(bounds.yMaximum())), int(round(bounds.xMinimum())), int(round(bounds.xMaximum()))
+    print np.size(img)
+   
+    if np.size(img) == 0:
+        raise cv2.error
 
     # Convert to 8 bit image for CV 
     img = (img/256).astype('uint8')
@@ -190,9 +209,9 @@ def vectorizeRaster(rasterPath, vectorName):
     """
     layer = processing.runalg('gdalogr:polygonize', rasterPath, 'DN', None)
     vectorPath = layer['OUTPUT']
-    return iface.addVectorLayer(vectorPath, vectorName, 'ogr')
+    return QgsVectorLayer(vectorPath, vectorName, 'ogr')
     
-def generateCoastlineMaskFromLayers(rasterLayer, domainLayer, outputLayer, thresholds):
+def maskFromLayers(rasterLayer, domainLayer, outputLayer, thresholds):
     """Description: Processes a raster image into a vector polygon ocean/land mask.
         Make sure to save the shapefile, as it will be deleted otherwise! 
         Input:  QgsRasterLayer rasterLayer - layer that contains the raster image to process
@@ -206,16 +225,38 @@ def generateCoastlineMaskFromLayers(rasterLayer, domainLayer, outputLayer, thres
     fileInfo = QFileInfo(fileSource)
     filePath = fileInfo.absolutePath()
     fileName = fileInfo.baseName()
+    fileQASource = filePath + os.path.sep + fileName[:fileName.rfind('_B')] + '_BQA.TIFF'
     maskName = fileName + '_masked'
     maskPath = filePath + os.path.sep + maskName + '.tif'
     polyMaskName = fileName + '_masked_polygon'
     polyMaskPath = filePath + os.path.sep + polyMaskName + '.shp'
+    maskIceName = fileName + '_masked_ice'
+    maskIcePath = filePath + os.path.sep + maskIceName + '.tif'
+    maskCloudName = fileName + '_masked_cloud'
+    maskCloudPath = filePath + os.path.sep + maskCloudName + '.tif'
+
+    print fileSource
 
     # Load geotiff and get domain layer/bounding box of area to mask
     geotiff = gdal.Open(fileSource)
     feature = domainLayer.getFeatures().next()
     domain = feature.geometry().boundingBox()
-    bounds = geotiffWorldToPixelCoords(geotiff, domain)
+    rasterCRS = rasterLayer.crs().authid()
+    domainCRS = domainLayer.crs().authid()
+    bounds = geotiffWorldToPixelCoords(geotiff, domain, rasterCRS, domainCRS)
+    
+    print domain.toString(), bounds.toString()
+    
+    # Generate QA masks
+    #masker = LandsatMasker(fileQASource, collection=1)
+    
+    # algorithm has high confidence that this condition exists
+    # (67-100 percent confidence)
+    #conf = LandsatConfidence.high
+    # Get mask indicating cloud pixels with high confidence
+    #mask = masker.get_cloud_mask(conf)
+    # save the result
+    #masker.save_tif(mask, 'result.tif')
 
     # Execute masking algorithms
     filteredImage = filterImage(geotiff, bounds, thresholds[0], thresholds[1])
@@ -223,7 +264,9 @@ def generateCoastlineMaskFromLayers(rasterLayer, domainLayer, outputLayer, thres
 
     # Save results to files and layers
     arrayToRaster(mask, geotiff, bounds, maskPath)
-    rasterLayer = iface.addRasterLayer(maskPath, maskName)
+    #rasterLayer = iface.addRasterLayer(maskPath, maskName)
+    #vectorLayer = vectorizeRaster(maskPath, polyMaskName)
+    rasterLayer = QgsRasterLayer(maskPath, maskName)
     vectorLayer = vectorizeRaster(maskPath, polyMaskName)
     
     return rasterLayer, vectorLayer
